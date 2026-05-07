@@ -27,7 +27,10 @@ def test_multi_group_triggers_inter_compaction(tmp_path):
         user_turns, cwd=tmp_path,
         max_turns=8,
         env_extra={
-            "LOCAL_AGENT_COMPACT_THRESHOLD": "4000",
+            # Threshold has to be below the baseline prompt size (system prompt
+            # + tool schemas, ~1500 tokens) so the trigger fires within the
+            # 12-turn run. 800 is comfortably under that.
+            "LOCAL_AGENT_COMPACT_THRESHOLD": "800",
             "LOCAL_AGENT_COMPACT_KEEP": "3",
         },
         timeout=1200,
