@@ -42,11 +42,15 @@ WRITE_ROOTS: list[Path] = []
 MAX_FILE_CHARS = 80_000
 MAX_OUTPUT_CHARS = 24_000
 
-COMPACT_PROMPT_TOKEN_THRESHOLD = int(os.environ.get("LOCAL_AGENT_COMPACT_THRESHOLD", "100000"))
+_THRESHOLD_OVERRIDE = os.environ.get("LOCAL_AGENT_COMPACT_THRESHOLD")
+COMPACT_PROMPT_TOKEN_THRESHOLD_OVERRIDE: int | None = int(_THRESHOLD_OVERRIDE) if _THRESHOLD_OVERRIDE else None
+COMPACT_THRESHOLD_RATIO = float(os.environ.get("LOCAL_AGENT_COMPACT_THRESHOLD_RATIO", "0.7"))
+COMPACT_THRESHOLD_FALLBACK = 100_000
 COMPACT_KEEP_LAST_GROUPS = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP", "3")))
 COMPACT_KEEP_LAST_EXCHANGES = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP_EXCHANGES", "4")))
 COMPACT_MARKER = "\n\n# Compacted earlier conversation\n"
 INTRA_SUMMARY_MARKER = "[Earlier work in this task — summary]\n"
+N_KEEP_TOKENS = int(os.environ.get("LOCAL_AGENT_N_KEEP", "4096"))
 
 BLOCKED_COMMAND_PATTERNS = [
     "rm -rf", "rm -fr", "mkfs", "dd if=", ":(){", "shutdown", "reboot", "poweroff",
@@ -749,6 +753,42 @@ def compact_messages(
     return new_messages, True, "; ".join(notes)
 
 
+EMPTY_RETRY_NUDGE = (
+    "Your previous turn produced reasoning but no tool call and no final answer. "
+    "Either call a tool to make progress on the task, or write a brief final response now."
+)
+
+
+def _make_request(
+    client: OpenAI,
+    messages: list[dict[str, Any]],
+    model: str,
+    tools: list[dict[str, Any]],
+    temperature: float,
+    top_p: float,
+    thinking: bool,
+    stats: dict[str, Any],
+) -> Any:
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        temperature=temperature,
+        top_p=top_p,
+        extra_body={"top_k": 20, "n_keep": N_KEEP_TOKENS, "chat_template_kwargs": {"enable_thinking": thinking}},
+    )
+    usage = getattr(resp, "usage", None)
+    if usage is not None:
+        pt = getattr(usage, "prompt_tokens", None)
+        ct = getattr(usage, "completion_tokens", None)
+        if pt is not None:
+            stats["last_prompt_tokens"] = int(pt)
+        if ct is not None:
+            stats["last_completion_tokens"] = int(ct)
+    return resp.choices[0].message
+
+
 def run_loop(
     client: OpenAI,
     messages: list[dict[str, Any]],
@@ -772,7 +812,8 @@ def run_loop(
         if max_turns and turn > max_turns:
             return 2, f"[blocked] max turns reached ({max_turns})"
         last_pt = int(stats.get("last_prompt_tokens", 0) or 0)
-        if last_pt > COMPACT_PROMPT_TOKEN_THRESHOLD:
+        threshold = int(stats.get("compact_threshold", COMPACT_THRESHOLD_FALLBACK) or COMPACT_THRESHOLD_FALLBACK)
+        if last_pt > threshold:
             new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose)
             if did:
                 messages.clear()
@@ -784,24 +825,22 @@ def run_loop(
                 print(f"[compact] skipped: {note}", file=sys.stderr)
         if verbose:
             print(f"\n=== TURN {turn} ===", file=sys.stderr)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=tools_for(os.environ.get("QWEN_AGENT_DISABLE_SUBAGENT") != "1"),
-            tool_choice="auto",
-            temperature=temperature,
-            top_p=top_p,
-            extra_body={"top_k": 20, "chat_template_kwargs": {"enable_thinking": thinking}},
-        )
-        usage = getattr(resp, "usage", None)
-        if usage is not None:
-            pt = getattr(usage, "prompt_tokens", None)
-            ct = getattr(usage, "completion_tokens", None)
-            if pt is not None:
-                stats["last_prompt_tokens"] = int(pt)
-            if ct is not None:
-                stats["last_completion_tokens"] = int(ct)
-        msg = resp.choices[0].message
+        tools = tools_for(os.environ.get("QWEN_AGENT_DISABLE_SUBAGENT") != "1")
+        msg = _make_request(client, messages, model, tools, temperature, top_p, thinking, stats)
+
+        # Empty-response watchdog: Qwen thinking mode sometimes emits a full <think> block
+        # and then content="" with no tool_calls. The harness would otherwise treat that as
+        # a normal final answer. If we see that pattern, append the empty message + a nudge,
+        # and retry once with thinking off.
+        if not msg.tool_calls and not (msg.content or "").strip():
+            reasoning = getattr(msg, "reasoning_content", None)
+            if reasoning:
+                print("[watchdog] empty response after thinking; nudging and retrying without thinking", file=sys.stderr)
+                messages.append(message_to_dict(msg))
+                messages.append({"role": "user", "content": EMPTY_RETRY_NUDGE})
+                stats["empty_retries"] = int(stats.get("empty_retries", 0)) + 1
+                msg = _make_request(client, messages, model, tools, temperature, top_p, False, stats)
+
         messages.append(message_to_dict(msg))
 
         reasoning = getattr(msg, "reasoning_content", None)
@@ -813,6 +852,8 @@ def run_loop(
 
         if not msg.tool_calls:
             final = (msg.content or "").strip()
+            if not final:
+                return 3, "[empty response — model produced no tool call and no final answer; try /compact or rephrase]"
             return 0, final
 
         for tc in msg.tool_calls:
@@ -845,6 +886,32 @@ def run_loop(
 
 def initial_messages(cwd: Path) -> list[dict[str, Any]]:
     return [{"role": "system", "content": SYSTEM_PROMPT + f"\nWorking directory: {cwd}"}]
+
+
+def query_server_n_ctx(base_url: str) -> int | None:
+    import urllib.request
+    root = base_url.rstrip("/")
+    if root.endswith("/v1"):
+        root = root[:-3]
+    try:
+        with urllib.request.urlopen(root + "/props", timeout=3) as r:
+            data = json.load(r)
+    except Exception:
+        return None
+    n_ctx = data.get("default_generation_settings", {}).get("n_ctx")
+    if isinstance(n_ctx, int) and n_ctx > 0:
+        return n_ctx
+    return None
+
+
+def compute_compact_threshold(base_url: str) -> tuple[int, str]:
+    """Return (threshold, source) where source describes how it was derived."""
+    if COMPACT_PROMPT_TOKEN_THRESHOLD_OVERRIDE is not None:
+        return COMPACT_PROMPT_TOKEN_THRESHOLD_OVERRIDE, f"env LOCAL_AGENT_COMPACT_THRESHOLD={COMPACT_PROMPT_TOKEN_THRESHOLD_OVERRIDE}"
+    n_ctx = query_server_n_ctx(base_url)
+    if n_ctx:
+        return int(n_ctx * COMPACT_THRESHOLD_RATIO), f"{COMPACT_THRESHOLD_RATIO:g} * server n_ctx={n_ctx}"
+    return COMPACT_THRESHOLD_FALLBACK, f"fallback (server /props unreachable at {base_url})"
 
 
 def estimate_prompt_tokens(messages: list[dict[str, Any]]) -> int:
@@ -900,7 +967,8 @@ def run_agent(task: str, cwd: Path, max_turns: int, verbose: bool, base_url: str
     client = OpenAI(base_url=base_url, api_key="local-not-needed")
     messages = initial_messages(cwd)
     messages.append({"role": "user", "content": task})
-    stats: dict[str, Any] = {}
+    threshold, source = compute_compact_threshold(base_url)
+    stats: dict[str, Any] = {"compact_threshold": threshold, "compact_threshold_source": source}
     code, final = run_loop(client, messages, cwd, max_turns, verbose, model, temperature, top_p, thinking, show_thinking, stats, bg_base_url)
     print(final)
     return code
@@ -936,7 +1004,9 @@ def background_jobs_text(cwd: Path) -> str:
 
 def run_repl(cwd: Path, max_turns: int, verbose: bool, base_url: str, model: str, temperature: float, top_p: float, thinking: bool, show_thinking: bool, clear_jobs_on_start: bool = False, bg_base_url: str = DEFAULT_BG_BASE_URL) -> int:
     client = OpenAI(base_url=base_url, api_key="local-not-needed")
-    stats: dict[str, Any] = {}
+    threshold, threshold_src = compute_compact_threshold(base_url)
+    stats: dict[str, Any] = {"compact_threshold": threshold, "compact_threshold_source": threshold_src}
+    print(f"compact threshold: {threshold} prompt-tokens ({threshold_src}); n_keep={N_KEEP_TOKENS}")
     if clear_jobs_on_start:
         cleared = clear_background_jobs(cwd)
         if cleared:
@@ -951,8 +1021,8 @@ def run_repl(cwd: Path, max_turns: int, verbose: bool, base_url: str, model: str
                 print(f"stripped reasoning_content from {stripped} message(s)")
             est_pt = estimate_prompt_tokens(messages)
             stats["last_prompt_tokens"] = est_pt
-            if est_pt > COMPACT_PROMPT_TOKEN_THRESHOLD:
-                print(f"resumed transcript estimated at ~{est_pt} prompt tokens (> threshold {COMPACT_PROMPT_TOKEN_THRESHOLD}); pre-compacting...")
+            if est_pt > threshold:
+                print(f"resumed transcript estimated at ~{est_pt} prompt tokens (> threshold {threshold}); pre-compacting...")
                 new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose=True)
                 if did:
                     messages = new_messages
@@ -1011,7 +1081,10 @@ def run_repl(cwd: Path, max_turns: int, verbose: bool, base_url: str, model: str
             chars = sum(len(str(m.get("content", ""))) for m in messages)
             last_pt = stats.get("last_prompt_tokens", "?")
             comp = stats.get("compactions", 0)
-            print(f"messages={len(messages)} approx_content_chars={chars} last_prompt_tokens={last_pt} compactions={comp} threshold={COMPACT_PROMPT_TOKEN_THRESHOLD} transcript={transcript_path}")
+            thr = stats.get("compact_threshold", COMPACT_THRESHOLD_FALLBACK)
+            src = stats.get("compact_threshold_source", "?")
+            empty = stats.get("empty_retries", 0)
+            print(f"messages={len(messages)} approx_content_chars={chars} last_prompt_tokens={last_pt} compactions={comp} empty_retries={empty} threshold={thr} ({src}) transcript={transcript_path}")
             continue
         if line == "/compact":
             new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose=True)
