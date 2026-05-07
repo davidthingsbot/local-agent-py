@@ -58,6 +58,12 @@ BLOCKED_COMMAND_PATTERNS = [
     "nc ", "ncat ", "telnet ", "ssh ", "gh repo delete", "git push", "git clean -fdx",
 ]
 
+DECOMPOSITION_CLAUSE = """## Task decomposition
+
+For multi-step tasks, prefer to work in checkpoints. After roughly ten tool calls, end your turn with a brief progress summary listing what you have done, what is left, and any decisions made. Then wait for the user to say "continue" or to redirect. This keeps context manageable and lets the user steer.
+"""
+
+
 CAPABILITIES_TEXT = """# Qwen3.6 Agent Harness Capabilities
 
 You are Qwen3.6 running in a tiny local agent harness.
@@ -820,6 +826,11 @@ def run_loop(
                 messages.extend(new_messages)
                 stats["last_prompt_tokens"] = 0
                 stats["compactions"] = int(stats.get("compactions", 0)) + 1
+                if "inter-group:" in note:
+                    stats["inter_compactions"] = int(stats.get("inter_compactions", 0)) + 1
+                if "intra-group:" in note:
+                    stats["intra_compactions"] = int(stats.get("intra_compactions", 0)) + 1
+                stats["last_compact_at_turn"] = turn
                 print(f"[compact] {note}", file=sys.stderr)
             elif verbose:
                 print(f"[compact] skipped: {note}", file=sys.stderr)
@@ -885,7 +896,10 @@ def run_loop(
 
 
 def initial_messages(cwd: Path) -> list[dict[str, Any]]:
-    return [{"role": "system", "content": SYSTEM_PROMPT + f"\nWorking directory: {cwd}"}]
+    sys_text = SYSTEM_PROMPT + f"\nWorking directory: {cwd}"
+    if os.environ.get("LOCAL_AGENT_DECOMPOSE") == "1":
+        sys_text += "\n\n" + DECOMPOSITION_CLAUSE
+    return [{"role": "system", "content": sys_text}]
 
 
 def query_server_n_ctx(base_url: str) -> int | None:
@@ -1027,6 +1041,10 @@ def run_repl(cwd: Path, max_turns: int, verbose: bool, base_url: str, model: str
                 if did:
                     messages = new_messages
                     stats["compactions"] = int(stats.get("compactions", 0)) + 1
+                    if "inter-group:" in note:
+                        stats["inter_compactions"] = int(stats.get("inter_compactions", 0)) + 1
+                    if "intra-group:" in note:
+                        stats["intra_compactions"] = int(stats.get("intra_compactions", 0)) + 1
                     stats["last_prompt_tokens"] = estimate_prompt_tokens(messages)
                     print(f"[compact] {note}")
                 else:
@@ -1081,10 +1099,19 @@ def run_repl(cwd: Path, max_turns: int, verbose: bool, base_url: str, model: str
             chars = sum(len(str(m.get("content", ""))) for m in messages)
             last_pt = stats.get("last_prompt_tokens", "?")
             comp = stats.get("compactions", 0)
+            inter = stats.get("inter_compactions", 0)
+            intra = stats.get("intra_compactions", 0)
+            last_compact_turn = stats.get("last_compact_at_turn", "-")
             thr = stats.get("compact_threshold", COMPACT_THRESHOLD_FALLBACK)
             src = stats.get("compact_threshold_source", "?")
             empty = stats.get("empty_retries", 0)
-            print(f"messages={len(messages)} approx_content_chars={chars} last_prompt_tokens={last_pt} compactions={comp} empty_retries={empty} threshold={thr} ({src}) transcript={transcript_path}")
+            print(
+                f"messages={len(messages)} approx_content_chars={chars} "
+                f"last_prompt_tokens={last_pt} "
+                f"compactions={comp} (inter={inter} intra={intra} last_at_turn={last_compact_turn}) "
+                f"empty_retries={empty} threshold={thr} ({src}) "
+                f"transcript={transcript_path}"
+            )
             continue
         if line == "/compact":
             new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose=True)
@@ -1093,6 +1120,10 @@ def run_repl(cwd: Path, max_turns: int, verbose: bool, base_url: str, model: str
                 messages.extend(new_messages)
                 stats["last_prompt_tokens"] = 0
                 stats["compactions"] = int(stats.get("compactions", 0)) + 1
+                if "inter-group:" in note:
+                    stats["inter_compactions"] = int(stats.get("inter_compactions", 0)) + 1
+                if "intra-group:" in note:
+                    stats["intra_compactions"] = int(stats.get("intra_compactions", 0)) + 1
                 save_transcript(transcript_path, cwd, messages)
                 print(f"compact: {note}")
             else:
