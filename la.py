@@ -44,7 +44,9 @@ MAX_OUTPUT_CHARS = 24_000
 
 COMPACT_PROMPT_TOKEN_THRESHOLD = int(os.environ.get("LOCAL_AGENT_COMPACT_THRESHOLD", "100000"))
 COMPACT_KEEP_LAST_GROUPS = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP", "3")))
+COMPACT_KEEP_LAST_EXCHANGES = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP_EXCHANGES", "4")))
 COMPACT_MARKER = "\n\n# Compacted earlier conversation\n"
+INTRA_SUMMARY_MARKER = "[Earlier work in this task — summary]\n"
 
 BLOCKED_COMMAND_PATTERNS = [
     "rm -rf", "rm -fr", "mkfs", "dd if=", ":(){", "shutdown", "reboot", "poweroff",
@@ -592,21 +594,61 @@ def summarize_via_bg(text: str, bg_base_url: str, model: str, prior_summary: str
     return (resp.choices[0].message.content or "").strip()
 
 
-def compact_messages(
-    messages: list[dict[str, Any]],
+def split_group_into_exchanges(group: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, list[list[dict[str, Any]]]]:
+    """Split a user-bounded group into (user_msg, exchanges).
+    An exchange is a list starting with one assistant message, optionally followed by
+    its matching tool responses. Cuts always fall at exchange boundaries, so
+    tool_call / tool-response pairs are never separated.
+    """
+    if not group or group[0].get("role") != "user":
+        return None, []
+    user_msg = group[0]
+    exchanges: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for m in group[1:]:
+        role = m.get("role")
+        if role == "assistant":
+            if current:
+                exchanges.append(current)
+            current = [m]
+        else:
+            current.append(m)
+    if current:
+        exchanges.append(current)
+    return user_msg, exchanges
+
+
+def render_exchanges_for_summary(exchanges: list[list[dict[str, Any]]]) -> str:
+    out: list[str] = []
+    for ex in exchanges:
+        for m in ex:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role == "assistant":
+                if content:
+                    out.append(f"ASSISTANT: {truncate(content, 4000)}")
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                    name = fn.get("name", "?")
+                    args = fn.get("arguments", "") or ""
+                    out.append(f"ASSISTANT calls {name}({truncate(args, 600)})")
+            elif role == "tool":
+                out.append(f"TOOL: {truncate(content, 1500)}")
+    return "\n".join(out)
+
+
+def _compact_inter_group(
+    head: list[dict[str, Any]],
+    groups: list[list[dict[str, Any]]],
     bg_base_url: str,
     model: str,
-    keep_last_groups: int = COMPACT_KEEP_LAST_GROUPS,
-    verbose: bool = False,
-) -> tuple[list[dict[str, Any]], bool, str]:
-    head, groups = split_groups(messages)
-    if not head:
-        return messages, False, "no system message; refusing to compact"
+    keep_last_groups: int,
+    verbose: bool,
+) -> tuple[list[dict[str, Any]], list[list[dict[str, Any]]], bool, str]:
     if len(groups) <= keep_last_groups + 1:
-        return messages, False, f"only {len(groups)} group(s); nothing to compact"
-
+        return head, groups, False, f"only {len(groups)} group(s)"
     to_summarize = groups[:-keep_last_groups]
-    keep_tail = groups[-keep_last_groups:]
+    keep_tail = list(groups[-keep_last_groups:])
 
     sys_msg = head[0]
     sys_content = sys_msg.get("content", "") or ""
@@ -617,18 +659,94 @@ def compact_messages(
 
     transcript_text = render_groups_for_summary(to_summarize)
     if verbose:
-        print(f"[compact] summarizing {len(to_summarize)} group(s), ~{len(transcript_text)} chars", file=sys.stderr)
-
+        print(f"[compact-inter] summarizing {len(to_summarize)} group(s), ~{len(transcript_text)} chars", file=sys.stderr)
     try:
         summary = summarize_via_bg(transcript_text, bg_base_url, model, prior_summary)
     except Exception as e:
-        return messages, False, f"summarize failed: {e}"
+        return head, groups, False, f"inter-group summarize failed: {e}"
 
     new_sys = {**sys_msg, "content": base_sys.rstrip() + COMPACT_MARKER + summary}
-    new_messages: list[dict[str, Any]] = [new_sys] + head[1:]
-    for g in keep_tail:
+    new_head = [new_sys] + head[1:]
+    return new_head, keep_tail, True, f"compacted {len(to_summarize)} group(s) into {len(summary)} chars"
+
+
+def _compact_intra_group(
+    group: list[dict[str, Any]],
+    bg_base_url: str,
+    model: str,
+    keep_last_exchanges: int,
+    verbose: bool,
+) -> tuple[list[dict[str, Any]], bool, str]:
+    user_msg, exchanges = split_group_into_exchanges(group)
+    if user_msg is None:
+        return group, False, "active group not user-bounded"
+
+    prior_summary: str | None = None
+    if exchanges and len(exchanges[0]) == 1:
+        first = exchanges[0][0]
+        first_content = first.get("content", "") or ""
+        if first.get("role") == "assistant" and not first.get("tool_calls") and first_content.startswith(INTRA_SUMMARY_MARKER):
+            prior_summary = first_content[len(INTRA_SUMMARY_MARKER):]
+            exchanges = exchanges[1:]
+
+    if len(exchanges) <= keep_last_exchanges + 1:
+        return group, False, f"active group has {len(exchanges)} exchange(s) after prior summary"
+
+    to_summarize = exchanges[:-keep_last_exchanges]
+    keep_tail = exchanges[-keep_last_exchanges:]
+    transcript_text = render_exchanges_for_summary(to_summarize)
+    if verbose:
+        print(f"[compact-intra] summarizing {len(to_summarize)} exchange(s), ~{len(transcript_text)} chars", file=sys.stderr)
+    try:
+        summary = summarize_via_bg(transcript_text, bg_base_url, model, prior_summary)
+    except Exception as e:
+        return group, False, f"intra-group summarize failed: {e}"
+
+    summary_msg = {"role": "assistant", "content": INTRA_SUMMARY_MARKER + summary}
+    new_group: list[dict[str, Any]] = [user_msg, summary_msg]
+    for ex in keep_tail:
+        new_group.extend(ex)
+    return new_group, True, f"compacted {len(to_summarize)} exchange(s) into {len(summary)} chars"
+
+
+def compact_messages(
+    messages: list[dict[str, Any]],
+    bg_base_url: str,
+    model: str,
+    keep_last_groups: int = COMPACT_KEEP_LAST_GROUPS,
+    keep_last_exchanges: int = COMPACT_KEEP_LAST_EXCHANGES,
+    verbose: bool = False,
+) -> tuple[list[dict[str, Any]], bool, str]:
+    head, groups = split_groups(messages)
+    if not head:
+        return messages, False, "no system message; refusing to compact"
+
+    notes: list[str] = []
+    did_any = False
+
+    head, groups, did_inter, note_inter = _compact_inter_group(head, groups, bg_base_url, model, keep_last_groups, verbose)
+    if did_inter:
+        notes.append(f"inter-group: {note_inter}")
+        did_any = True
+
+    if groups:
+        new_active, did_intra, note_intra = _compact_intra_group(groups[-1], bg_base_url, model, keep_last_exchanges, verbose)
+        if did_intra:
+            groups[-1] = new_active
+            notes.append(f"intra-group: {note_intra}")
+            did_any = True
+
+    if not did_any:
+        suffix_parts = [note_inter]
+        if groups:
+            _, ex_in_active = split_group_into_exchanges(groups[-1])
+            suffix_parts.append(f"active group has {len(ex_in_active)} exchange(s); keep_last_exchanges={keep_last_exchanges}")
+        return messages, False, "nothing to compact (" + "; ".join(p for p in suffix_parts if p) + ")"
+
+    new_messages: list[dict[str, Any]] = list(head)
+    for g in groups:
         new_messages.extend(g)
-    return new_messages, True, f"compacted {len(to_summarize)} group(s) into summary of {len(summary)} chars"
+    return new_messages, True, "; ".join(notes)
 
 
 def run_loop(
@@ -655,7 +773,7 @@ def run_loop(
             return 2, f"[blocked] max turns reached ({max_turns})"
         last_pt = int(stats.get("last_prompt_tokens", 0) or 0)
         if last_pt > COMPACT_PROMPT_TOKEN_THRESHOLD:
-            new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, verbose)
+            new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose)
             if did:
                 messages.clear()
                 messages.extend(new_messages)
@@ -813,7 +931,7 @@ def run_repl(cwd: Path, max_turns: int, verbose: bool, base_url: str, model: str
     save_transcript(transcript_path, cwd, messages)
     print("Qwen3.6 agent REPL")
     print(f"cwd: {cwd}")
-    print(f"thinking: {thinking} show_thinking: {show_thinking}")
+    print(f"thinking: {thinking} show_thinking: {show_thinking} max_turns_per_task: {max_turns or 'unlimited'}")
     print("Commands: /help, /jobs, /clear-jobs, /reset, /context, /compact, /transcript, /quit")
     while True:
         try:
@@ -855,7 +973,7 @@ def run_repl(cwd: Path, max_turns: int, verbose: bool, base_url: str, model: str
             print(f"messages={len(messages)} approx_content_chars={chars} last_prompt_tokens={last_pt} compactions={comp} threshold={COMPACT_PROMPT_TOKEN_THRESHOLD} transcript={transcript_path}")
             continue
         if line == "/compact":
-            new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, verbose=True)
+            new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose=True)
             if did:
                 messages.clear()
                 messages.extend(new_messages)
@@ -883,7 +1001,7 @@ def main() -> int:
     ap.add_argument("--repl", "-i", action="store_true", help="Start an interactive agent REPL")
     ap.add_argument("--cwd", default=str(DEFAULT_CWD), help="Working directory")
     ap.add_argument("--write-dir", action="append", default=[], help="Additional writable root (repeatable). Tilde-expanded and resolved.")
-    ap.add_argument("--max-turns", type=int, default=0, help="Maximum agent turns per task. 0 = unlimited (default).")
+    ap.add_argument("--max-turns", type=int, default=40, help="Maximum agent turns per task. 0 = unlimited.")
     ap.add_argument("--base-url", default=DEFAULT_BASE_URL)
     ap.add_argument("--bg-base-url", default=DEFAULT_BG_BASE_URL, help="Background-model base URL used for compaction summaries and subagents.")
     ap.add_argument("--model", default=DEFAULT_MODEL)
