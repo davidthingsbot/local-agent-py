@@ -496,10 +496,10 @@ def execute_tool(cwd: Path, name: str, args: dict[str, Any], thinking: bool = Tr
 
 
 def message_to_dict(msg: Any) -> dict[str, Any]:
+    # Intentionally drop reasoning_content: it's per-turn scratch space (Qwen <think>),
+    # not consumed by the chat template on subsequent turns. Persisting it bloats the
+    # transcript and the next request payload without changing model behavior.
     d = {"role": "assistant", "content": msg.content or ""}
-    reasoning = getattr(msg, "reasoning_content", None)
-    if reasoning:
-        d["reasoning_content"] = reasoning
     if getattr(msg, "tool_calls", None):
         d["tool_calls"] = []
         for tc in msg.tool_calls:
@@ -847,6 +847,32 @@ def initial_messages(cwd: Path) -> list[dict[str, Any]]:
     return [{"role": "system", "content": SYSTEM_PROMPT + f"\nWorking directory: {cwd}"}]
 
 
+def estimate_prompt_tokens(messages: list[dict[str, Any]]) -> int:
+    """Rough char-based estimator for prompt size. Used when usage data is unavailable
+    (e.g. immediately after resuming a transcript). Counts content, reasoning_content
+    if present, and tool_call argument strings. ~3 chars/token is conservative for
+    Qwen on mixed text/code; better to over-trigger compaction than to hang."""
+    chars = 0
+    for m in messages:
+        chars += len(str(m.get("content", "") or ""))
+        chars += len(str(m.get("reasoning_content", "") or ""))
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+            chars += len(str(fn.get("arguments", "") or ""))
+            chars += len(str(fn.get("name", "") or ""))
+    return chars // 3
+
+
+def strip_reasoning_content(messages: list[dict[str, Any]]) -> int:
+    """Remove reasoning_content from loaded messages. Returns count of fields dropped."""
+    n = 0
+    for m in messages:
+        if "reasoning_content" in m:
+            del m["reasoning_content"]
+            n += 1
+    return n
+
+
 def directory_policy_text(cwd: Path) -> str:
     roots = writable_roots(cwd)
     writable_lines = "\n".join(f"- {r}" for r in roots)
@@ -920,6 +946,21 @@ def run_repl(cwd: Path, max_turns: int, verbose: bool, base_url: str, model: str
         try:
             messages = load_transcript(transcript_path)
             print(f"resumed transcript: {transcript_path} ({len(messages)} messages)")
+            stripped = strip_reasoning_content(messages)
+            if stripped:
+                print(f"stripped reasoning_content from {stripped} message(s)")
+            est_pt = estimate_prompt_tokens(messages)
+            stats["last_prompt_tokens"] = est_pt
+            if est_pt > COMPACT_PROMPT_TOKEN_THRESHOLD:
+                print(f"resumed transcript estimated at ~{est_pt} prompt tokens (> threshold {COMPACT_PROMPT_TOKEN_THRESHOLD}); pre-compacting...")
+                new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose=True)
+                if did:
+                    messages = new_messages
+                    stats["compactions"] = int(stats.get("compactions", 0)) + 1
+                    stats["last_prompt_tokens"] = estimate_prompt_tokens(messages)
+                    print(f"[compact] {note}")
+                else:
+                    print(f"[compact] {note}")
         except Exception as e:
             print(f"failed to load {transcript_path}: {e}; starting fresh")
             messages = initial_messages(cwd)
