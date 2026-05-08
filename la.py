@@ -50,6 +50,8 @@ COMPACT_KEEP_LAST_GROUPS = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP",
 COMPACT_KEEP_LAST_EXCHANGES = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP_EXCHANGES", "4")))
 COMPACT_MARKER = "\n\n# Compacted earlier conversation\n"
 INTRA_SUMMARY_MARKER = "[Earlier work in this task — summary]\n"
+PINNED_REQUEST_HEADER = "## Original request (verbatim — pinned)"
+PINNED_OUTPUTS_HEADER = "## Open outputs (files written this session)"
 N_KEEP_TOKENS = int(os.environ.get("LOCAL_AGENT_N_KEEP", "4096"))
 
 BLOCKED_COMMAND_PATTERNS = [
@@ -569,20 +571,24 @@ def render_groups_for_summary(groups: list[list[dict[str, Any]]]) -> str:
 SUMMARIZER_SYSTEM = """You compress agent transcripts. Produce a concise operational summary so the agent can continue without losing essential context.
 
 Preserve:
-- User goals and any pending asks
 - Files read or written, with paths
 - Commands run and important outcomes (success/failure, key output)
 - Decisions and the reasons for them
 - Errors encountered and whether resolved
-- Current state of work — what was just being done
+- Current state of work — what was just being done, and what is INCOMPLETE
 
 Drop verbose tool output, repetition, and conversational filler.
 
-Output sections:
-## User goals
+Hard rules:
+- Do NOT output a "## Original request" section. The original user request is pinned and inserted before your output by the harness.
+- Do NOT output an "## Open outputs" section. Open output files are tracked separately and inserted by the harness.
+- Do NOT declare the task complete or finished unless the user explicitly confirmed completion. Continuation cues like "continue", "next batch", "resume" mean the work is in progress — your "Current state" should describe what is still pending, not assert that the task is done.
+- Do NOT paraphrase or summarize the original user request — the pinned block is the source of truth for what was asked.
+
+Output sections (in this order, no others):
 ## Files touched
 ## Key actions and findings
-## Current state
+## Current state (what is incomplete and what should happen next)
 """
 
 
@@ -647,6 +653,81 @@ def render_exchanges_for_summary(exchanges: list[list[dict[str, Any]]]) -> str:
     return "\n".join(out)
 
 
+def _first_user_text_in_groups(groups: list[list[dict[str, Any]]]) -> str | None:
+    """Return the content of the first user message across these groups, or None."""
+    for g in groups:
+        for m in g:
+            if m.get("role") == "user":
+                content = (m.get("content") or "").strip()
+                if content:
+                    return content
+                return None
+    return None
+
+
+def _split_pinned_blocks(prior_summary: str) -> tuple[str | None, str]:
+    """Extract the '## Original request' block from a prior summary.
+
+    Returns (orig_request_block_or_None, residual_summary).
+    The 'Open outputs' block is *dropped* on the way out — it's rebuilt from
+    current stats every compaction so it never goes stale, and we don't want
+    the BG model to see and copy a snapshot version.
+    """
+    if not prior_summary:
+        return None, prior_summary or ""
+    lines = prior_summary.splitlines()
+    orig_lines: list[str] = []
+    residual_lines: list[str] = []
+    mode = "pre"  # "pre" | "orig" | "outputs" | "other"
+    for line in lines:
+        stripped = line.strip()
+        if stripped == PINNED_REQUEST_HEADER:
+            mode = "orig"
+            orig_lines.append(line)
+            continue
+        if stripped == PINNED_OUTPUTS_HEADER:
+            mode = "outputs"
+            continue
+        if line.startswith("## "):
+            mode = "other"
+            residual_lines.append(line)
+            continue
+        if mode == "orig":
+            orig_lines.append(line)
+        elif mode == "outputs":
+            pass  # drop
+        else:
+            residual_lines.append(line)
+    orig_block = "\n".join(orig_lines).strip() if orig_lines else None
+    residual = "\n".join(residual_lines).strip()
+    return orig_block, residual
+
+
+def _format_open_outputs_block(open_outputs: dict[str, int] | None) -> str | None:
+    if not open_outputs:
+        return None
+    lines = [PINNED_OUTPUTS_HEADER]
+    for path, chars in sorted(open_outputs.items()):
+        lines.append(f"- {path} (last write: {chars} chars)")
+    return "\n".join(lines)
+
+
+def _compose_pinned_summary(
+    orig_request_block: str | None,
+    open_outputs_block: str | None,
+    body: str,
+) -> str:
+    parts: list[str] = []
+    if orig_request_block:
+        parts.append(orig_request_block)
+    if open_outputs_block:
+        parts.append(open_outputs_block)
+    body = (body or "").strip()
+    if body:
+        parts.append(body)
+    return "\n\n".join(parts)
+
+
 def _compact_inter_group(
     head: list[dict[str, Any]],
     groups: list[list[dict[str, Any]]],
@@ -654,6 +735,7 @@ def _compact_inter_group(
     model: str,
     keep_last_groups: int,
     verbose: bool,
+    open_outputs: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], list[list[dict[str, Any]]], bool, str]:
     if len(groups) <= keep_last_groups + 1:
         return head, groups, False, f"only {len(groups)} group(s)"
@@ -667,13 +749,28 @@ def _compact_inter_group(
     if COMPACT_MARKER in sys_content:
         base_sys, _, prior_summary = sys_content.partition(COMPACT_MARKER)
 
+    # Split pinned blocks out of the prior summary before sending to BG. The BG
+    # model only ever sees the residual, so it can never paraphrase, drop, or
+    # falsely declare completion of the original request.
+    orig_request_block: str | None = None
+    residual_prior: str | None = None
+    if prior_summary:
+        orig_request_block, residual_prior = _split_pinned_blocks(prior_summary)
+    if orig_request_block is None:
+        first_user = _first_user_text_in_groups(to_summarize)
+        if first_user:
+            orig_request_block = f"{PINNED_REQUEST_HEADER}\n{first_user}"
+
     transcript_text = render_groups_for_summary(to_summarize)
     if verbose:
         print(f"[compact-inter] summarizing {len(to_summarize)} group(s), ~{len(transcript_text)} chars", file=sys.stderr)
     try:
-        summary = summarize_via_bg(transcript_text, bg_base_url, model, prior_summary)
+        body = summarize_via_bg(transcript_text, bg_base_url, model, residual_prior)
     except Exception as e:
         return head, groups, False, f"inter-group summarize failed: {e}"
+
+    open_outputs_block = _format_open_outputs_block(open_outputs)
+    summary = _compose_pinned_summary(orig_request_block, open_outputs_block, body)
 
     new_sys = {**sys_msg, "content": base_sys.rstrip() + COMPACT_MARKER + summary}
     new_head = [new_sys] + head[1:]
@@ -726,6 +823,7 @@ def compact_messages(
     keep_last_groups: int = COMPACT_KEEP_LAST_GROUPS,
     keep_last_exchanges: int = COMPACT_KEEP_LAST_EXCHANGES,
     verbose: bool = False,
+    open_outputs: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], bool, str]:
     head, groups = split_groups(messages)
     if not head:
@@ -734,7 +832,7 @@ def compact_messages(
     notes: list[str] = []
     did_any = False
 
-    head, groups, did_inter, note_inter = _compact_inter_group(head, groups, bg_base_url, model, keep_last_groups, verbose)
+    head, groups, did_inter, note_inter = _compact_inter_group(head, groups, bg_base_url, model, keep_last_groups, verbose, open_outputs)
     if did_inter:
         notes.append(f"inter-group: {note_inter}")
         did_any = True
@@ -820,7 +918,7 @@ def run_loop(
         last_pt = int(stats.get("last_prompt_tokens", 0) or 0)
         threshold = int(stats.get("compact_threshold", COMPACT_THRESHOLD_FALLBACK) or COMPACT_THRESHOLD_FALLBACK)
         if last_pt > threshold:
-            new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose)
+            new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose, open_outputs=stats.get("open_outputs"))
             if did:
                 messages.clear()
                 messages.extend(new_messages)
@@ -874,6 +972,9 @@ def run_loop(
             except json.JSONDecodeError:
                 args = {}
             result = execute_tool(cwd, name, args, thinking)
+            if name == "write_file" and isinstance(result, dict) and result.get("ok"):
+                outputs = stats.setdefault("open_outputs", {})
+                outputs[str(result.get("path"))] = int(result.get("chars", 0))
             if verbose:
                 print(f"[tool] {name}({json.dumps(args, ensure_ascii=False)})", file=sys.stderr)
                 print(f"[result] {truncate(json.dumps(result, ensure_ascii=False), 2000)}", file=sys.stderr)
@@ -1037,7 +1138,7 @@ def run_repl(cwd: Path, max_turns: int, verbose: bool, base_url: str, model: str
             stats["last_prompt_tokens"] = est_pt
             if est_pt > threshold:
                 print(f"resumed transcript estimated at ~{est_pt} prompt tokens (> threshold {threshold}); pre-compacting...")
-                new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose=True)
+                new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose=True, open_outputs=stats.get("open_outputs"))
                 if did:
                     messages = new_messages
                     stats["compactions"] = int(stats.get("compactions", 0)) + 1
@@ -1114,7 +1215,7 @@ def run_repl(cwd: Path, max_turns: int, verbose: bool, base_url: str, model: str
             )
             continue
         if line == "/compact":
-            new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose=True)
+            new_messages, did, note = compact_messages(messages, bg_base_url, model, COMPACT_KEEP_LAST_GROUPS, COMPACT_KEEP_LAST_EXCHANGES, verbose=True, open_outputs=stats.get("open_outputs"))
             if did:
                 messages.clear()
                 messages.extend(new_messages)
