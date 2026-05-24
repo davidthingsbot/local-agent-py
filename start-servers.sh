@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Start llama-server for local-agent-py.
 #
-# Default mode: one 256K-context foreground Qwen server spread across all NVIDIA
-# GPUs. This is the mode to use for hard/deep-context tasks.
+# Default mode: one dual-slot Qwen server spread across all NVIDIA GPUs.
+# It exposes two simultaneous 256K-context slots by using --ctx-size 524288 -np 2.
 #
 # Optional split mode: set LOCAL_AGENT_SPLIT_SERVERS=1 to start the older layout
 # with one foreground server on GPU 0 and one smaller background server on GPU 1.
@@ -12,7 +12,8 @@ LLAMA_SERVER="${LLAMA_SERVER:-$HOME/work/llama.cpp/build/bin/llama-server}"
 FG_MODEL="${FG_MODEL:-$HOME/models/gguf/qwen3.6/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf}"
 BG_MODEL="${BG_MODEL:-$HOME/models/gguf/qwen3.6/Qwen3.6-27B-GGUF/Qwen3.6-27B-UD-IQ2_XXS.gguf}"
 BASE_PORT="${BASE_PORT:-19434}"
-CTX_SIZE="${CTX_SIZE:-262144}"
+CTX_SIZE="${CTX_SIZE:-524288}"
+PARALLEL_SLOTS="${LOCAL_AGENT_PARALLEL_SLOTS:-2}"
 SPLIT_SERVERS="${LOCAL_AGENT_SPLIT_SERVERS:-0}"
 
 if [ ! -x "$LLAMA_SERVER" ]; then
@@ -84,9 +85,9 @@ import sys
 print(','.join(['1'] * int(sys.argv[1])))
 PY
 )
-log="/tmp/local-agent-srv-256k.log"
+log="/tmp/local-agent-srv-2slot-256k.log"
 
-echo "single-server mode: GPUs=$gpu_csv port=$BASE_PORT ctx=$CTX_SIZE model=$(basename "$FG_MODEL") log=$log"
+echo "single-server mode: GPUs=$gpu_csv port=$BASE_PORT ctx=$CTX_SIZE slots=$PARALLEL_SLOTS model=$(basename "$FG_MODEL") log=$log"
 # Stop the foreground port plus the old background port if present.
 stop_port "$BASE_PORT"
 stop_port "$((BASE_PORT + 1))"
@@ -94,7 +95,7 @@ sleep 1
 
 env CUDA_VISIBLE_DEVICES="$gpu_csv" nohup "$LLAMA_SERVER" \
   -m "$FG_MODEL" --host 127.0.0.1 --port "$BASE_PORT" \
-  -ngl 99 --ctx-size "$CTX_SIZE" -np 1 \
+  -ngl 99 --ctx-size "$CTX_SIZE" -np "$PARALLEL_SLOTS" \
   --split-mode layer --tensor-split "$split_csv" \
   --flash-attn on -ctk q8_0 -ctv q8_0 --jinja \
   --temp 0.7 --top-k 20 --top-p 0.9 --min-p 0.0 --presence-penalty 0.2 \
@@ -104,4 +105,4 @@ wait_ready "$BASE_PORT" "$!" "$log" "local-agent Qwen"
 
 echo
 echo "endpoint: http://127.0.0.1:${BASE_PORT}/v1"
-echo "props:    curl -s http://127.0.0.1:${BASE_PORT}/props | jq '.model_alias, .default_generation_settings.n_ctx'"
+echo "props:    curl -s http://127.0.0.1:${BASE_PORT}/props | jq '.model_alias, .total_slots, .default_generation_settings.n_ctx'"

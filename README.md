@@ -2,7 +2,7 @@
 
 Tiny local REPL/agent harness for testing Qwen3.6 as an agent.
 
-Default target: one 256K-context llama.cpp server on `http://127.0.0.1:19434/v1`, with the Qwen3.6 35B-A3B MoE spread across both RTX 3090s.
+Default target: one dual-slot llama.cpp server on `http://127.0.0.1:19434/v1`, with the Qwen3.6 35B-A3B MoE spread across both RTX 3090s. It is configured as `--ctx-size 524288 -np 2`, giving two simultaneous slots of 256K context each.
 
 Start/restart that server:
 
@@ -11,21 +11,21 @@ cd ~/work/local-agent-py
 ./start-servers.sh
 ```
 
-The harness defaults are tuned for deep-context work: 256K server context, compaction around 85% of available context, 16K `n_keep`, large file/tool-result caps, and 8192 max completion tokens.
+The harness defaults are tuned for deep-context work: 256K context per active slot, compaction around 90% of available context, 16K `n_keep`, large file/tool-result caps, and 8192 max completion tokens.
 
 ## Deep-context operating notes
 
-The current preferred setup is **one large foreground server using both RTX 3090s**, not one foreground model plus a separate background model. The point is to give the main agent enough context to do hard tasks without constantly compacting or rediscovering state.
+The current preferred setup is **one dual-slot foreground server using both RTX 3090s**, not one foreground model plus a separate background model. The point is to allow two simultaneous hard-task sessions while preserving 256K context per slot.
 
 Verified configuration:
 
 - Model: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` — 35B total / ~3B active MoE.
 - Server: `llama-server` on `127.0.0.1:19434`.
 - GPUs: both RTX 3090s via `CUDA_VISIBLE_DEVICES=0,1`.
-- Context: `--ctx-size 262144` with one slot (`-np 1`).
+- Context: `--ctx-size 524288` with two slots (`-np 2`), which llama.cpp reports as `n_ctx=262144` per slot.
 - Split: `--split-mode layer --tensor-split 1,1`.
 - KV: q8 (`-ctk q8_0 -ctv q8_0`).
-- Memory after load was roughly 15GB on GPU 0 and 14GB on GPU 1, leaving headroom.
+- Memory after load is roughly 16.2GB on GPU 0 and 14.8GB on GPU 1, leaving about 8.3GB / 9.7GB headroom in a concurrent smoke test.
 
 Why this matters:
 
@@ -53,7 +53,7 @@ systemctl --user status local-agent-qwen.service
 systemctl --user restart local-agent-qwen.service
 ```
 
-The service starts the same 256K dual-GPU Qwen server on `127.0.0.1:19434` and is enabled for boot/login via user linger. `./start-servers.sh` remains the repo-local manual restart script and should match the service configuration.
+The service starts the same dual-GPU, two-slot Qwen server on `127.0.0.1:19434` and is enabled for boot/login via user linger. `./start-servers.sh` remains the repo-local manual restart script and should match the service configuration.
 
 ## Hard-task behavior
 
@@ -119,5 +119,5 @@ Background job files live under the sandbox at `.qwen-agent-jobs/<job-id>/`. In 
 - Use `--cwd` directly with `la.py` to choose a different sandbox. Writes are only allowed under that directory.
 - `-v` shows tool calls/results, which is useful for evaluating agent behavior.
 - `/reset` clears the REPL conversation context.
-- `QWEN_BG_BASE_URL` is optional now. If unset, compaction/subagent calls use the same 256K server as foreground work. Set it only when deliberately running a separate background server.
-- To restore the old one-server-per-GPU layout, run `LOCAL_AGENT_SPLIT_SERVERS=1 ./start-servers.sh`.
+- `QWEN_BG_BASE_URL` is optional now. If unset, compaction/subagent calls use the same two-slot server as foreground work. Set it only when deliberately running a separate background server.
+- To restore the known-good one-slot 256K setup, use git tag `known-good-256k-1slot` plus the saved service file `~/.config/systemd/user/local-agent-qwen.service.known-good-1slot-256k`. To restore the older one-server-per-GPU layout, run `LOCAL_AGENT_SPLIT_SERVERS=1 ./start-servers.sh`.

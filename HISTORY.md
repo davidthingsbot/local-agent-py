@@ -38,3 +38,13 @@ Second tuning subagent implemented minimal hard-task reliability changes:
 - Final report: `~/work/la-test/local_agent_settings_iteration_report.md`.
 
 Remaining risks: no pre-request prompt-size estimate/enforcement yet; checkpointing is still prompt-only; subagent descriptions could be clearer.
+
+## 2026-05-24 — Preferred two-slot service mode
+
+David asked to preserve the known-good setup but make the two-session experiment the preferred setting for now. Current preferred service config:
+
+- `local-agent-qwen.service` runs one llama.cpp server on both RTX 3090s.
+- `--ctx-size 524288 -np 2`, reported by `/props` + `/slots` as two slots with `n_ctx=262144` each.
+- Concurrent smoke test launched two `./la.py` hard tasks simultaneously; both exited `0` and wrote reports.
+- Peak observed memory during the concurrent smoke test: GPU0 ~16.3GB / 24GB, GPU1 ~14.9GB / 24GB, leaving ~8.3GB and ~9.7GB headroom.
+- Restore point: git tag `known-good-256k-1slot`; service backup at `~/.config/systemd/user/local-agent-qwen.service.known-good-1slot-256k`.

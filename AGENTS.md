@@ -8,7 +8,7 @@ Make the loop succeed on hard tasks that require deep context. David explicitly 
 
 ## Preferred server setup
 
-Use one 256K-context foreground server across both RTX 3090s. On David's machine this is enabled as a user systemd service:
+Use one two-slot foreground server across both RTX 3090s. On David's machine this is enabled as a user systemd service and configured as `--ctx-size 524288 -np 2`, yielding two simultaneous 256K-context slots:
 
 ```bash
 systemctl --user status local-agent-qwen.service
@@ -48,7 +48,7 @@ Empty-response recovery now uses four retries; the final retry re-enables thinki
 
 ## Deep-context lessons learned
 
-- 256K context is confirmed working on this machine with q8 KV.
+- Two simultaneous 256K-context slots are confirmed working on this machine with q8 KV (`--ctx-size 524288 -np 2`).
 - A 679,955-character file was read into the tool result; llama.cpp processed ~235K prompt tokens in ~186s, and Qwen correctly found sentinels at the beginning, middle, and end.
 - Slow prompt ingestion is acceptable for hard tasks, but repeated ingestion of the same giant context on every turn is not.
 - Preserve important task state explicitly: checkpoint files, concise progress summaries, and targeted reads beat repeatedly dumping giant files.
