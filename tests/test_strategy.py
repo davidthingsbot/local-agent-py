@@ -39,6 +39,9 @@ def _force_compaction(monkeypatch):
 
 
 def test_run_loop_records_inter_compaction(monkeypatch, stub_summarizer, tmp_path):
+    # Force the old small keep window so this test still exercises inter-group
+    # compaction even though production defaults now preserve more context.
+    monkeypatch.setattr(la, "COMPACT_KEEP_LAST_GROUPS", 3)
     # Build a transcript with 6 user-bounded groups to force inter-group compaction.
     msgs = [sys_msg()]
     for i in range(6):
@@ -59,6 +62,9 @@ def test_run_loop_records_inter_compaction(monkeypatch, stub_summarizer, tmp_pat
 
 
 def test_run_loop_records_intra_compaction(monkeypatch, stub_summarizer, tmp_path):
+    # Force the old small keep window so this test still exercises intra-group
+    # compaction even though production defaults now preserve more context.
+    monkeypatch.setattr(la, "COMPACT_KEEP_LAST_EXCHANGES", 4)
     # Single user-bounded group with many exchanges → forces intra-group.
     msgs = [sys_msg(), user_msg("big task")]
     for i in range(10):

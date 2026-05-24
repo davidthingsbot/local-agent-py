@@ -33,26 +33,29 @@ except ImportError:
     raise
 
 DEFAULT_BASE_URL = os.environ.get("QWEN_BASE_URL", "http://127.0.0.1:19434/v1")
-DEFAULT_BG_BASE_URL = os.environ.get("QWEN_BG_BASE_URL", "http://127.0.0.1:19435/v1")
+# Default compaction/subagent work to the same 256K foreground server. Set
+# QWEN_BG_BASE_URL explicitly only when a separate background server is running.
+DEFAULT_BG_BASE_URL = os.environ.get("QWEN_BG_BASE_URL", DEFAULT_BASE_URL)
 DEFAULT_MODEL = os.environ.get("QWEN_MODEL", "qwen")
 DEFAULT_CWD = Path(os.environ.get("LOCAL_AGENT_CWD", str(Path.home() / ".openclaw" / "workspace"))).expanduser()
 
 WRITE_ROOTS: list[Path] = []
 
-MAX_FILE_CHARS = 80_000
-MAX_OUTPUT_CHARS = 24_000
+MAX_FILE_CHARS = int(os.environ.get("LOCAL_AGENT_MAX_FILE_CHARS", "700000"))
+MAX_OUTPUT_CHARS = int(os.environ.get("LOCAL_AGENT_MAX_OUTPUT_CHARS", "240000"))
 
 _THRESHOLD_OVERRIDE = os.environ.get("LOCAL_AGENT_COMPACT_THRESHOLD")
 COMPACT_PROMPT_TOKEN_THRESHOLD_OVERRIDE: int | None = int(_THRESHOLD_OVERRIDE) if _THRESHOLD_OVERRIDE else None
-COMPACT_THRESHOLD_RATIO = float(os.environ.get("LOCAL_AGENT_COMPACT_THRESHOLD_RATIO", "0.7"))
-COMPACT_THRESHOLD_FALLBACK = 100_000
-COMPACT_KEEP_LAST_GROUPS = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP", "3")))
-COMPACT_KEEP_LAST_EXCHANGES = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP_EXCHANGES", "4")))
+COMPACT_THRESHOLD_RATIO = float(os.environ.get("LOCAL_AGENT_COMPACT_THRESHOLD_RATIO", "0.85"))
+COMPACT_THRESHOLD_FALLBACK = 220_000
+COMPACT_KEEP_LAST_GROUPS = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP", "8")))
+COMPACT_KEEP_LAST_EXCHANGES = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP_EXCHANGES", "12")))
 COMPACT_MARKER = "\n\n# Compacted earlier conversation\n"
 INTRA_SUMMARY_MARKER = "[Earlier work in this task — summary]\n"
 PINNED_REQUEST_HEADER = "## Original request (verbatim — pinned)"
 PINNED_OUTPUTS_HEADER = "## Open outputs (files written this session)"
-N_KEEP_TOKENS = int(os.environ.get("LOCAL_AGENT_N_KEEP", "4096"))
+N_KEEP_TOKENS = int(os.environ.get("LOCAL_AGENT_N_KEEP", "16384"))
+MAX_COMPLETION_TOKENS = int(os.environ.get("LOCAL_AGENT_MAX_COMPLETION_TOKENS", "8192"))
 
 BLOCKED_COMMAND_PATTERNS = [
     "rm -rf", "rm -fr", "mkfs", "dd if=", ":(){", "shutdown", "reboot", "poweroff",
@@ -73,7 +76,7 @@ You are Qwen3.6 running in a tiny local agent harness.
 ## Tools
 
 - list_dir(path, max_entries=100): list directory contents with names, types, and sizes.
-- read_file(path, max_chars=80000): read a UTF-8 text file, truncated for safety.
+- read_file(path, max_chars=700000): read a UTF-8 text file. For deep-context tasks, request a larger max_chars value when you need the whole file.
 - write_file(path, content): write a UTF-8 text file under the current agent working directory only.
 - run_shell(command, timeout_seconds=20): run a conservative local shell command in the current working directory.
 - ask_subagent(task, max_turns=6): delegate a bounded task to a fresh isolated Qwen subagent using the same working directory. Subagents cannot spawn further subagents.
@@ -125,7 +128,7 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path, absolute or relative to cwd."},
-                    "max_chars": {"type": "integer", "description": "Maximum chars to return."},
+                    "max_chars": {"type": "integer", "description": "Maximum chars to return. Default and maximum are controlled by LOCAL_AGENT_MAX_FILE_CHARS; current default is 700000."},
                 },
                 "required": ["path"],
             },
@@ -862,6 +865,18 @@ EMPTY_RETRY_NUDGE = (
     "Either call a tool to make progress on the task, or write a brief final response now."
 )
 
+EMPTY_RETRY_NUDGE_GENERIC = (
+    "Your previous turn was empty: no tool call and no final answer. "
+    "Continue the original task now. If you need more information, call a tool. "
+    "If the task is complete, write a concise final answer."
+)
+
+EMPTY_AFTER_COMPACT_NUDGE = (
+    "The conversation was just compacted. The pinned original request and any open outputs "
+    "in the system message are authoritative. Continue from that state now: call exactly one "
+    "tool to make concrete progress, or write a concise final answer if no tool is needed."
+)
+
 
 def _make_request(
     client: OpenAI,
@@ -880,6 +895,7 @@ def _make_request(
         tool_choice="auto",
         temperature=temperature,
         top_p=top_p,
+        max_tokens=MAX_COMPLETION_TOKENS,
         extra_body={"top_k": 20, "n_keep": N_KEEP_TOKENS, "chat_template_kwargs": {"enable_thinking": thinking}},
     )
     usage = getattr(resp, "usage", None)
@@ -911,6 +927,7 @@ def run_loop(
     if stats is None:
         stats = {}
     turn = 0
+    just_compacted = False
     while True:
         turn += 1
         if max_turns and turn > max_turns:
@@ -929,6 +946,7 @@ def run_loop(
                 if "intra-group:" in note:
                     stats["intra_compactions"] = int(stats.get("intra_compactions", 0)) + 1
                 stats["last_compact_at_turn"] = turn
+                just_compacted = True
                 print(f"[compact] {note}", file=sys.stderr)
             elif verbose:
                 print(f"[compact] skipped: {note}", file=sys.stderr)
@@ -937,18 +955,30 @@ def run_loop(
         tools = tools_for(os.environ.get("QWEN_AGENT_DISABLE_SUBAGENT") != "1")
         msg = _make_request(client, messages, model, tools, temperature, top_p, thinking, stats)
 
-        # Empty-response watchdog: Qwen thinking mode sometimes emits a full <think> block
-        # and then content="" with no tool_calls. The harness would otherwise treat that as
-        # a normal final answer. If we see that pattern, append the empty message + a nudge,
-        # and retry once with thinking off.
-        if not msg.tool_calls and not (msg.content or "").strip():
+        # Empty-response watchdog: Qwen sometimes returns content="" with no
+        # tool_calls, especially after compaction or after emitting only a
+        # thinking block. That is not a useful final answer. Retry a few times
+        # with an explicit nudge, thinking disabled, and lower temperature. Do
+        # not persist the empty assistant turn: it is non-information and can
+        # poison the next prompt.
+        empty_attempts = 0
+        while not msg.tool_calls and not (msg.content or "").strip() and empty_attempts < 3:
+            empty_attempts += 1
             reasoning = getattr(msg, "reasoning_content", None)
             if reasoning:
-                print("[watchdog] empty response after thinking; nudging and retrying without thinking", file=sys.stderr)
-                messages.append(message_to_dict(msg))
-                messages.append({"role": "user", "content": EMPTY_RETRY_NUDGE})
-                stats["empty_retries"] = int(stats.get("empty_retries", 0)) + 1
-                msg = _make_request(client, messages, model, tools, temperature, top_p, False, stats)
+                why = "after thinking"
+                nudge = EMPTY_RETRY_NUDGE
+            elif just_compacted:
+                why = "after compaction"
+                nudge = EMPTY_AFTER_COMPACT_NUDGE
+            else:
+                why = "with no reasoning"
+                nudge = EMPTY_RETRY_NUDGE_GENERIC
+            print(f"[watchdog] empty response {why}; retry {empty_attempts}/3 with thinking off", file=sys.stderr)
+            messages.append({"role": "user", "content": nudge})
+            stats["empty_retries"] = int(stats.get("empty_retries", 0)) + 1
+            msg = _make_request(client, messages, model, tools, min(temperature, 0.2), min(top_p, 0.8), False, stats)
+        just_compacted = False
 
         messages.append(message_to_dict(msg))
 
@@ -1082,9 +1112,14 @@ def run_agent(task: str, cwd: Path, max_turns: int, verbose: bool, base_url: str
     client = OpenAI(base_url=base_url, api_key="local-not-needed")
     messages = initial_messages(cwd)
     messages.append({"role": "user", "content": task})
+    transcript_path = new_transcript_path(cwd)
+    save_transcript(transcript_path, cwd, messages)
+    if verbose:
+        print(f"transcript: {transcript_path}", file=sys.stderr)
     threshold, source = compute_compact_threshold(base_url)
     stats: dict[str, Any] = {"compact_threshold": threshold, "compact_threshold_source": source}
     code, final = run_loop(client, messages, cwd, max_turns, verbose, model, temperature, top_p, thinking, show_thinking, stats, bg_base_url)
+    save_transcript(transcript_path, cwd, messages)
     print(final)
     return code
 

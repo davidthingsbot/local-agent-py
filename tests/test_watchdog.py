@@ -1,14 +1,13 @@
 """Tier 3: empty-response watchdog.
 
-When Qwen3 thinking mode emits a full <think> block but no content and no
-tool_calls, run_loop must:
-- detect that pattern (only when reasoning_content is present)
-- append the empty assistant message + EMPTY_RETRY_NUDGE user message
-- retry once with thinking=False
+When Qwen3 emits no content and no tool_calls, run_loop must:
+- detect that as a non-answer
+- append a nudge user message, but not persist the empty assistant message
+- retry up to three times with thinking=False and cooler sampling
 - bump stats["empty_retries"]
 
-If the retry is also empty, exit with code 3 and a clear message.
-A genuinely-empty response (no reasoning) is NOT retried (it would loop).
+If all retries are also empty, exit with code 3 and a clear message.
+Genuinely-empty responses without reasoning are retried too; this matters after compaction.
 """
 from __future__ import annotations
 
@@ -46,27 +45,29 @@ def test_thinking_only_response_triggers_retry_with_thinking_off(tmp_path):
     assert first_call["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
 
 
-def test_thinking_only_then_empty_again_returns_code_3(tmp_path):
+def test_thinking_only_then_empty_retries_exhausted_returns_code_3(tmp_path):
     msgs = [sys_msg(), user_msg("do something")]
     scripted = [
         fake_response(content="", reasoning="thoughts"),
-        fake_response(content=""),  # retry also empty
+        fake_response(content=""),
+        fake_response(content=""),
+        fake_response(content=""),
     ]
     code, final, stats, _ = _run(msgs, scripted, tmp_path=tmp_path)
     assert code == 3
     assert "empty response" in final
-    assert stats["empty_retries"] == 1
+    assert stats["empty_retries"] == 3
 
 
-def test_genuinely_empty_response_without_reasoning_is_not_retried(tmp_path):
-    """If the model returns content="" with no tool_calls AND no reasoning_content,
-    we don't retry — that would loop. We exit 3 immediately."""
+def test_genuinely_empty_response_without_reasoning_is_retried(tmp_path):
+    """Empty responses without reasoning happen after compaction; retry them too."""
     msgs = [sys_msg(), user_msg("hi")]
-    scripted = [fake_response(content="", reasoning=None)]
+    scripted = [fake_response(content="", reasoning=None), fake_response(content="ok")]
     code, final, stats, client = _run(msgs, scripted, tmp_path=tmp_path)
-    assert code == 3
-    assert stats.get("empty_retries", 0) == 0
-    assert len(client.calls) == 1
+    assert code == 0
+    assert final == "ok"
+    assert stats.get("empty_retries", 0) == 1
+    assert len(client.calls) == 2
 
 
 def test_watchdog_appends_nudge_in_correct_order(tmp_path):
@@ -77,12 +78,11 @@ def test_watchdog_appends_nudge_in_correct_order(tmp_path):
     ]
     code, final, _, _ = _run(msgs, scripted, tmp_path=tmp_path)
     assert code == 0 and final == "final"
-    # transcript shape: system, user(orig), assistant(empty), user(nudge), assistant(final)
+    # transcript shape: system, user(orig), user(nudge), assistant(final)
     roles = [m["role"] for m in msgs]
-    assert roles == ["system", "user", "assistant", "user", "assistant"]
-    assert msgs[2]["content"] == ""           # empty assistant turn preserved
-    assert msgs[3]["content"] == la.EMPTY_RETRY_NUDGE
-    assert msgs[4]["content"] == "final"
+    assert roles == ["system", "user", "user", "assistant"]
+    assert msgs[2]["content"] == la.EMPTY_RETRY_NUDGE
+    assert msgs[3]["content"] == "final"
 
 
 def test_watchdog_does_not_intercept_tool_call(tmp_path):

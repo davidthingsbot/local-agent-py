@@ -2,11 +2,47 @@
 
 Tiny local REPL/agent harness for testing Qwen3.6 as an agent.
 
-It talks to the currently-running llama.cpp OpenAI-compatible server at:
+Default target: one 256K-context llama.cpp server on `http://127.0.0.1:19434/v1`, with the Qwen3.6 35B-A3B MoE spread across both RTX 3090s.
 
-```text
-http://127.0.0.1:19434/v1
+Start/restart that server:
+
+```bash
+cd ~/work/local-agent-py
+./start-servers.sh
 ```
+
+The harness defaults are tuned for deep-context work: 256K server context, compaction around 85% of available context, 16K `n_keep`, large file/tool-result caps, and 8192 max completion tokens.
+
+## Deep-context operating notes
+
+The current preferred setup is **one large foreground server using both RTX 3090s**, not one foreground model plus a separate background model. The point is to give the main agent enough context to do hard tasks without constantly compacting or rediscovering state.
+
+Verified configuration:
+
+- Model: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` — 35B total / ~3B active MoE.
+- Server: `llama-server` on `127.0.0.1:19434`.
+- GPUs: both RTX 3090s via `CUDA_VISIBLE_DEVICES=0,1`.
+- Context: `--ctx-size 262144` with one slot (`-np 1`).
+- Split: `--split-mode layer --tensor-split 1,1`.
+- KV: q8 (`-ctk q8_0 -ctv q8_0`).
+- Memory after load was roughly 15GB on GPU 0 and 14GB on GPU 1, leaving headroom.
+
+Why this matters:
+
+- A huge first pass can take a while. That is acceptable for difficult work if subsequent turns reuse the existing conversation/KV context instead of rereading the same large material every turn.
+- Avoid asking the model to repeatedly re-open giant files unless the task genuinely needs it. Prefer keeping the important state in the active conversation, checkpoint files, or targeted follow-up reads.
+- The harness now delays compaction until around 85% of the server context. With 256K context, that means compaction should not happen prematurely on normal hard tasks.
+- `read_file` can return up to 700k characters by default, but the model may still choose a smaller `max_chars` unless the task explicitly asks for the full file or a large value.
+- If the model struggles on a large task, first check whether it actually received the required context, whether it asked for a truncated tool result, and whether compaction happened.
+
+Validation run:
+
+- Created `~/work/la-test/long-context-sentinel.txt` with 679,955 characters and sent it through `read_file(max_chars=700000)`.
+- Transcript contained a 685,051-character tool result including the end sentinel.
+- llama.cpp processed about 235,052 prompt tokens in ~186 seconds (~1262 prompt tokens/sec).
+- Qwen correctly recovered the beginning, middle, and end sentinels.
+
+Conclusion: 256K context works on this hardware. The main remaining challenge is loop design: avoid unnecessary repeated huge prompt ingestion, preserve task state explicitly, and make large reads intentional.
 
 ## Start the REPL
 
@@ -66,4 +102,5 @@ Background job files live under the sandbox at `.qwen-agent-jobs/<job-id>/`. In 
 - Use `--cwd` directly with `la.py` to choose a different sandbox. Writes are only allowed under that directory.
 - `-v` shows tool calls/results, which is useful for evaluating agent behavior.
 - `/reset` clears the REPL conversation context.
-- Current default disables Qwen thinking blocks for cleaner tool-loop behavior.
+- `QWEN_BG_BASE_URL` is optional now. If unset, compaction/subagent calls use the same 256K server as foreground work. Set it only when deliberately running a separate background server.
+- To restore the old one-server-per-GPU layout, run `LOCAL_AGENT_SPLIT_SERVERS=1 ./start-servers.sh`.
