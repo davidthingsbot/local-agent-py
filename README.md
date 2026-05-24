@@ -2,7 +2,7 @@
 
 Tiny local REPL/agent harness for testing Qwen3.6 as an agent.
 
-Default target: one dual-slot llama.cpp server on `http://127.0.0.1:19434/v1`, with the Qwen3.6 35B-A3B MoE spread across both RTX 3090s. It is configured as `--ctx-size 524288 -np 2`, giving two simultaneous slots of 256K context each.
+Default target: one dual-slot llama.cpp server on `http://127.0.0.1:19434/v1` locally, or `http://<model-host>:19434/v1` remotely, with the Qwen3.6 35B-A3B MoE spread across both RTX 3090s. It is configured as `--ctx-size 524288 -np 2`, giving two simultaneous slots of 256K context each.
 
 Start/restart that server:
 
@@ -20,7 +20,7 @@ The current preferred setup is **one dual-slot foreground server using both RTX 
 Verified configuration:
 
 - Model: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf` — 35B total / ~3B active MoE.
-- Server: `llama-server` on `127.0.0.1:19434`.
+- Server: `llama-server` bound to `0.0.0.0:19434` so clients on another machine can connect.
 - GPUs: both RTX 3090s via `CUDA_VISIBLE_DEVICES=0,1`.
 - Context: `--ctx-size 524288` with two slots (`-np 2`), which llama.cpp reports as `n_ctx=262144` per slot.
 - Split: `--split-mode layer --tensor-split 1,1`.
@@ -53,7 +53,24 @@ systemctl --user status local-agent-qwen.service
 systemctl --user restart local-agent-qwen.service
 ```
 
-The service starts the same dual-GPU, two-slot Qwen server on `127.0.0.1:19434` and is enabled for boot/login via user linger. `./start-servers.sh` remains the repo-local manual restart script and should match the service configuration.
+The service starts the same dual-GPU, two-slot Qwen server on `0.0.0.0:19434` and is enabled for boot/login via user linger. `./start-servers.sh` remains the repo-local manual restart script and should match the service configuration.
+
+
+## Running from another machine
+
+The model host now binds llama.cpp to all interfaces:
+
+```bash
+--host 0.0.0.0 --port 19434
+```
+
+From another machine, set:
+
+```bash
+QWEN_BASE_URL=http://<model-host-ip-or-tailnet-name>:19434/v1 ./la.sh
+```
+
+Use Tailscale or a trusted LAN/VPN. The llama.cpp endpoint has no real auth by default, so do **not** expose port `19434` directly to the public internet.
 
 ## Hard-task behavior
 

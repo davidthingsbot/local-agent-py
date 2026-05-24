@@ -1,12 +1,12 @@
 [Unit]
-Description=Local Agent Qwen 2-slot 256K-per-session llama-server (experimental)
+Description=Local Agent Qwen 2-slot 256K-per-session llama-server
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
 Environment=CUDA_VISIBLE_DEVICES=0,1
-ExecStart=/home/david/work/llama.cpp/build/bin/llama-server -m /home/david/models/gguf/qwen3.6/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --host 127.0.0.1 --port 19434 -ngl 99 --ctx-size 524288 -np 2 --split-mode layer --tensor-split 1,1 --flash-attn on -ctk q8_0 -ctv q8_0 --jinja --temp 0.7 --top-k 20 --top-p 0.9 --min-p 0.0 --presence-penalty 0.2
+ExecStart=/home/david/work/llama.cpp/build/bin/llama-server -m /home/david/models/gguf/qwen3.6/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf --host 0.0.0.0 --port 19434 -ngl 99 --ctx-size 524288 -np 2 --split-mode layer --tensor-split 1,1 --flash-attn on -ctk q8_0 -ctv q8_0 --jinja --temp 0.7 --top-k 20 --top-p 0.9 --min-p 0.0 --presence-penalty 0.2
 Restart=always
 RestartSec=5
 TimeoutStopSec=30

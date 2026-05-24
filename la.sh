@@ -19,9 +19,12 @@ if [[ "${1:-}" == "--capabilities" || "${1:-}" == "--dirs" ]]; then
   exec ./la.py --cwd "$LA_CWD" "${LA_WRITE_ARGS[@]}" "$@"
 fi
 
-if ! curl -fsS http://127.0.0.1:19434/health >/dev/null 2>&1; then
-  echo "Qwen server is not responding on http://127.0.0.1:19434"
-  echo "Start llama-server first, then re-run ./la.sh"
+QWEN_ROOT="${QWEN_BASE_URL:-http://127.0.0.1:19434/v1}"
+QWEN_ROOT="${QWEN_ROOT%/v1}"
+QWEN_ROOT="${QWEN_ROOT%/}"
+if ! curl -fsS "$QWEN_ROOT/health" >/dev/null 2>&1; then
+  echo "Qwen server is not responding at $QWEN_ROOT"
+  echo "Start llama-server, or set QWEN_BASE_URL=http://<model-host>:19434/v1, then re-run ./la.sh"
   exit 1
 fi
 

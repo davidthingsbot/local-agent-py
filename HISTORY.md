@@ -48,3 +48,9 @@ David asked to preserve the known-good setup but make the two-session experiment
 - Concurrent smoke test launched two `./la.py` hard tasks simultaneously; both exited `0` and wrote reports.
 - Peak observed memory during the concurrent smoke test: GPU0 ~16.3GB / 24GB, GPU1 ~14.9GB / 24GB, leaving ~8.3GB and ~9.7GB headroom.
 - Restore point: git tag `known-good-256k-1slot`; service backup at `~/.config/systemd/user/local-agent-qwen.service.known-good-1slot-256k`.
+
+## 2026-05-24 — Bind Qwen server to all interfaces
+
+David asked to make the model server reachable from other machines. Updated startup scripts, service templates, and docs to bind llama.cpp to `0.0.0.0:19434` and to support remote clients via `QWEN_BASE_URL=http://<model-host>:19434/v1`.
+
+Operational note: removed the Tailscale Serve TCP forward on `19434 -> 127.0.0.1:19434` because it blocked a true all-interface bind. Preserved the HTTPS Tailscale Serve route to `127.0.0.1:18789`.

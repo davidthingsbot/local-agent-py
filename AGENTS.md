@@ -8,7 +8,7 @@ Make the loop succeed on hard tasks that require deep context. David explicitly 
 
 ## Preferred server setup
 
-Use one two-slot foreground server across both RTX 3090s. On David's machine this is enabled as a user systemd service and configured as `--ctx-size 524288 -np 2`, yielding two simultaneous 256K-context slots:
+Use one two-slot foreground server bound to `0.0.0.0:19434` across both RTX 3090s. On David's machine this is enabled as a user systemd service and configured as `--ctx-size 524288 -np 2`, yielding two simultaneous 256K-context slots:
 
 ```bash
 systemctl --user status local-agent-qwen.service
@@ -24,7 +24,7 @@ cd ~/work/local-agent-py
 
 Expected live server:
 
-- URL: `http://127.0.0.1:19434/v1`
+- URL: local `http://127.0.0.1:19434/v1`; remote clients should set `QWEN_BASE_URL=http://<model-host>:19434/v1`.
 - Model: `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`
 - Type: MoE, 35B total / ~3B active
 - Context: 262144 tokens

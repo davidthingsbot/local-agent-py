@@ -68,7 +68,7 @@ if [ "$SPLIT_SERVERS" = "1" ]; then
     log="/tmp/local-agent-srv-gpu${gpu}-port${port}.log"
     echo "[$role] GPU $gpu port=$port ctx=$CTX_SIZE model=$(basename "$model") log=$log"
     env CUDA_VISIBLE_DEVICES="$gpu" nohup "$LLAMA_SERVER" \
-      -m "$model" --host 127.0.0.1 --port "$port" \
+      -m "$model" --host 0.0.0.0 --port "$port" \
       -ngl 99 --ctx-size "$CTX_SIZE" -np 1 \
       --flash-attn on -ctk "$ctk" -ctv "$ctv" --jinja \
       --temp 0.7 --top-k 20 --top-p 0.9 --min-p 0.0 --presence-penalty 0.2 \
@@ -94,7 +94,7 @@ stop_port "$((BASE_PORT + 1))"
 sleep 1
 
 env CUDA_VISIBLE_DEVICES="$gpu_csv" nohup "$LLAMA_SERVER" \
-  -m "$FG_MODEL" --host 127.0.0.1 --port "$BASE_PORT" \
+  -m "$FG_MODEL" --host 0.0.0.0 --port "$BASE_PORT" \
   -ngl 99 --ctx-size "$CTX_SIZE" -np "$PARALLEL_SLOTS" \
   --split-mode layer --tensor-split "$split_csv" \
   --flash-attn on -ctk q8_0 -ctv q8_0 --jinja \
