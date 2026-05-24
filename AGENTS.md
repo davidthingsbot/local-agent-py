@@ -8,7 +8,14 @@ Make the loop succeed on hard tasks that require deep context. David explicitly 
 
 ## Preferred server setup
 
-Use one 256K-context foreground server across both RTX 3090s:
+Use one 256K-context foreground server across both RTX 3090s. On David's machine this is enabled as a user systemd service:
+
+```bash
+systemctl --user status local-agent-qwen.service
+systemctl --user restart local-agent-qwen.service
+```
+
+For manual repo-local startup/restart, use:
 
 ```bash
 cd ~/work/local-agent-py
@@ -33,6 +40,12 @@ nvidia-smi
 
 Do **not** casually restart the old second/background server on port 19435. The current design intentionally dedicates both cards to the main long-context model. Only use `LOCAL_AGENT_SPLIT_SERVERS=1 ./start-servers.sh` when deliberately testing one-server-per-GPU behavior.
 
+## Hard-task behavior
+
+Hard-task decomposition guidance is now in the default system prompt. The model should plan multi-step work, checkpoint after roughly ten tool calls, create/update requested artifacts before another broad inspection pass, synthesize when approaching turn budget, and prefer relative write paths under the working directory.
+
+Empty-response recovery now uses four retries; the final retry re-enables thinking at low sampling.
+
 ## Deep-context lessons learned
 
 - 256K context is confirmed working on this machine with q8 KV.
@@ -48,7 +61,7 @@ Do **not** casually restart the old second/background server on port 19435. The 
 ## Harness defaults to preserve
 
 - `DEFAULT_BG_BASE_URL` falls back to the foreground server unless explicitly overridden.
-- Compaction ratio: 0.85 of server `n_ctx`.
+- Compaction ratio: 0.90 of server `n_ctx`.
 - Keep groups/exchanges: 8 / 12.
 - `LOCAL_AGENT_N_KEEP`: 16384.
 - `LOCAL_AGENT_MAX_COMPLETION_TOKENS`: 8192.
@@ -63,7 +76,7 @@ After changing context/server/tool-loop behavior, run at least:
 
 ```bash
 cd ~/work/local-agent-py
-python3 -m pytest tests/test_watchdog.py tests/test_empty_retry.py tests/test_threshold.py -q
+python3 -m pytest -q
 ```
 
 For real long-context validation, use the sentinel-file pattern from the README: force a large `read_file(max_chars=700000)` result and verify the model can recover facts from the beginning, middle, and end.

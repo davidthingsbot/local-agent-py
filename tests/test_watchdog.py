@@ -3,7 +3,7 @@
 When Qwen3 emits no content and no tool_calls, run_loop must:
 - detect that as a non-answer
 - append a nudge user message, but not persist the empty assistant message
-- retry up to three times with thinking=False and cooler sampling
+- retry up to four times, using cool no-thinking retries first and a final cool thinking-on retry
 - bump stats["empty_retries"]
 
 If all retries are also empty, exit with code 3 and a clear message.
@@ -52,11 +52,14 @@ def test_thinking_only_then_empty_retries_exhausted_returns_code_3(tmp_path):
         fake_response(content=""),
         fake_response(content=""),
         fake_response(content=""),
+        fake_response(content=""),
     ]
-    code, final, stats, _ = _run(msgs, scripted, tmp_path=tmp_path)
+    code, final, stats, client = _run(msgs, scripted, max_turns=6, tmp_path=tmp_path)
     assert code == 3
     assert "empty response" in final
-    assert stats["empty_retries"] == 3
+    assert stats["empty_retries"] == 4
+    assert client.calls[-1]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+    assert client.calls[-1]["temperature"] == 0.1
 
 
 def test_genuinely_empty_response_without_reasoning_is_retried(tmp_path):

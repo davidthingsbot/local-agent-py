@@ -45,6 +45,41 @@ def test_empty_response_without_reasoning_retries_and_recovers(tmp_path):
     assert messages[-1] == {"role": "assistant", "content": "recovered"}
 
 
+def test_empty_response_fourth_retry_reenables_thinking(tmp_path):
+    client = FakeClient([
+        fake_response(content=""),
+        fake_response(content=""),
+        fake_response(content=""),
+        fake_response(content=""),
+        fake_response(content="finally recovered"),
+    ])
+    stats: dict = {}
+    messages = [sys_msg(), user_msg("do the task")]
+
+    code, final = la.run_loop(
+        client,
+        messages,
+        cwd=tmp_path,
+        max_turns=6,
+        verbose=False,
+        model="x",
+        temperature=0.6,
+        top_p=0.95,
+        thinking=True,
+        show_thinking=False,
+        stats=stats,
+        bg_base_url="http://bg",
+    )
+
+    assert code == 0
+    assert final == "finally recovered"
+    assert stats.get("empty_retries") == 4
+    assert client.calls[3]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+    assert client.calls[4]["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+    assert client.calls[4]["temperature"] == 0.1
+    assert client.calls[4]["top_p"] == 0.7
+
+
 def test_empty_response_after_compaction_gets_compaction_specific_nudge(monkeypatch, tmp_path):
     def fake_compact(messages, *args, **kwargs):
         return messages, True, "intra-group: compacted fake exchange"

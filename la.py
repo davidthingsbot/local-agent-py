@@ -46,8 +46,8 @@ MAX_OUTPUT_CHARS = int(os.environ.get("LOCAL_AGENT_MAX_OUTPUT_CHARS", "240000"))
 
 _THRESHOLD_OVERRIDE = os.environ.get("LOCAL_AGENT_COMPACT_THRESHOLD")
 COMPACT_PROMPT_TOKEN_THRESHOLD_OVERRIDE: int | None = int(_THRESHOLD_OVERRIDE) if _THRESHOLD_OVERRIDE else None
-COMPACT_THRESHOLD_RATIO = float(os.environ.get("LOCAL_AGENT_COMPACT_THRESHOLD_RATIO", "0.85"))
-COMPACT_THRESHOLD_FALLBACK = 220_000
+COMPACT_THRESHOLD_RATIO = float(os.environ.get("LOCAL_AGENT_COMPACT_THRESHOLD_RATIO", "0.90"))
+COMPACT_THRESHOLD_FALLBACK = 250_000
 COMPACT_KEEP_LAST_GROUPS = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP", "8")))
 COMPACT_KEEP_LAST_EXCHANGES = max(1, int(os.environ.get("LOCAL_AGENT_COMPACT_KEEP_EXCHANGES", "12")))
 COMPACT_MARKER = "\n\n# Compacted earlier conversation\n"
@@ -65,7 +65,13 @@ BLOCKED_COMMAND_PATTERNS = [
 
 DECOMPOSITION_CLAUSE = """## Task decomposition
 
-For multi-step tasks, prefer to work in checkpoints. After roughly ten tool calls, end your turn with a brief progress summary listing what you have done, what is left, and any decisions made. Then wait for the user to say "continue" or to redirect. This keeps context manageable and lets the user steer.
+For multi-step or hard tasks, work in bounded checkpoints instead of inspecting indefinitely.
+
+- Start with a brief plan before tool calls when the task has multiple steps.
+- After roughly ten tool calls, write or present a concise progress summary: what you have done, what is left, and any decisions made. Then wait for the user to say "continue" or redirect.
+- If the task asks for an artifact, create or update it before doing another broad inspection pass.
+- If you are approaching the turn budget, synthesize the best partial answer now rather than continuing to read more files.
+- For write_file, prefer relative paths under the working directory unless the user explicitly asks for an absolute writable path.
 """
 
 
@@ -101,7 +107,7 @@ You are Qwen3.6 running in a tiny local agent harness.
 - End with a short final answer summarizing what you did and found.
 """
 
-SYSTEM_PROMPT = CAPABILITIES_TEXT
+SYSTEM_PROMPT = CAPABILITIES_TEXT + "\n\n" + DECOMPOSITION_CLAUSE
 
 TOOLS = [
     {
@@ -962,7 +968,8 @@ def run_loop(
         # not persist the empty assistant turn: it is non-information and can
         # poison the next prompt.
         empty_attempts = 0
-        while not msg.tool_calls and not (msg.content or "").strip() and empty_attempts < 3:
+        max_empty_retries = 4
+        while not msg.tool_calls and not (msg.content or "").strip() and empty_attempts < max_empty_retries:
             empty_attempts += 1
             reasoning = getattr(msg, "reasoning_content", None)
             if reasoning:
@@ -974,10 +981,14 @@ def run_loop(
             else:
                 why = "with no reasoning"
                 nudge = EMPTY_RETRY_NUDGE_GENERIC
-            print(f"[watchdog] empty response {why}; retry {empty_attempts}/3 with thinking off", file=sys.stderr)
+            retry_thinking = empty_attempts == max_empty_retries
+            retry_temperature = 0.1 if retry_thinking else min(temperature, 0.2)
+            retry_top_p = 0.7 if retry_thinking else min(top_p, 0.8)
+            mode = "thinking on" if retry_thinking else "thinking off"
+            print(f"[watchdog] empty response {why}; retry {empty_attempts}/{max_empty_retries} with {mode}", file=sys.stderr)
             messages.append({"role": "user", "content": nudge})
             stats["empty_retries"] = int(stats.get("empty_retries", 0)) + 1
-            msg = _make_request(client, messages, model, tools, min(temperature, 0.2), min(top_p, 0.8), False, stats)
+            msg = _make_request(client, messages, model, tools, retry_temperature, retry_top_p, retry_thinking, stats)
         just_compacted = False
 
         messages.append(message_to_dict(msg))
@@ -1028,8 +1039,6 @@ def run_loop(
 
 def initial_messages(cwd: Path) -> list[dict[str, Any]]:
     sys_text = SYSTEM_PROMPT + f"\nWorking directory: {cwd}"
-    if os.environ.get("LOCAL_AGENT_DECOMPOSE") == "1":
-        sys_text += "\n\n" + DECOMPOSITION_CLAUSE
     return [{"role": "system", "content": sys_text}]
 
 

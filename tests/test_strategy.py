@@ -1,7 +1,7 @@
 """Tier 6: tasking-strategy plumbing.
 
 Covers the new metrics (inter_compactions, intra_compactions,
-last_compact_at_turn) and the env-gated decomposition prompt clause.
+last_compact_at_turn) and the default hard-task decomposition prompt clause.
 """
 from __future__ import annotations
 
@@ -15,20 +15,21 @@ from conftest import (
 
 # ---------- decomposition clause ----------
 
-def test_decomposition_clause_off_by_default(monkeypatch, tmp_path):
+def test_decomposition_clause_on_by_default(monkeypatch, tmp_path):
     monkeypatch.delenv("LOCAL_AGENT_DECOMPOSE", raising=False)
-    msgs = la.initial_messages(tmp_path)
-    sys_text = msgs[0]["content"]
-    assert "Task decomposition" not in sys_text
-    assert "Working directory:" in sys_text
-
-
-def test_decomposition_clause_appended_when_env_set(monkeypatch, tmp_path):
-    monkeypatch.setenv("LOCAL_AGENT_DECOMPOSE", "1")
     msgs = la.initial_messages(tmp_path)
     sys_text = msgs[0]["content"]
     assert "Task decomposition" in sys_text
     assert "checkpoint" in sys_text.lower()
+    assert "roughly ten tool calls" in sys_text
+    assert "Working directory:" in sys_text
+
+
+def test_decomposition_clause_not_duplicated_when_env_set(monkeypatch, tmp_path):
+    monkeypatch.setenv("LOCAL_AGENT_DECOMPOSE", "1")
+    msgs = la.initial_messages(tmp_path)
+    sys_text = msgs[0]["content"]
+    assert sys_text.count("## Task decomposition") == 1
 
 
 # ---------- inter/intra counters in run_loop ----------

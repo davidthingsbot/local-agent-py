@@ -60,6 +60,7 @@ def test_threshold_fallback_when_props_unreachable(monkeypatch):
     _patch_urlopen(monkeypatch, payload=None, raise_exc=ConnectionRefusedError("nope"))
     threshold, source = la.compute_compact_threshold("http://127.0.0.1:19434/v1")
     assert threshold == la.COMPACT_THRESHOLD_FALLBACK
+    assert threshold == 250_000
     assert "fallback" in source
 
 
@@ -68,6 +69,20 @@ def test_threshold_fallback_when_props_lacks_n_ctx(monkeypatch):
     _patch_urlopen(monkeypatch, {"default_generation_settings": {}})
     threshold, source = la.compute_compact_threshold("http://127.0.0.1:19434/v1")
     assert threshold == la.COMPACT_THRESHOLD_FALLBACK
+
+
+def test_default_threshold_covers_known_700k_read_for_256k_context(monkeypatch):
+    """README validation: 679,955 chars produced ~235,052 prompt tokens.
+
+    The default 256K-context threshold should sit above that known single-read
+    workload so one large file read does not immediately force compaction before
+    the model can synthesize from it.
+    """
+    monkeypatch.setattr(la, "COMPACT_PROMPT_TOKEN_THRESHOLD_OVERRIDE", None)
+    _patch_urlopen(monkeypatch, {"default_generation_settings": {"n_ctx": 262144}})
+    threshold, source = la.compute_compact_threshold("http://127.0.0.1:19434/v1")
+    assert threshold >= 235_052
+    assert "0.9 * server n_ctx=262144" in source
 
 
 def test_query_server_n_ctx_strips_v1(monkeypatch):

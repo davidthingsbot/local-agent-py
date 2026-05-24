@@ -31,7 +31,7 @@ Why this matters:
 
 - A huge first pass can take a while. That is acceptable for difficult work if subsequent turns reuse the existing conversation/KV context instead of rereading the same large material every turn.
 - Avoid asking the model to repeatedly re-open giant files unless the task genuinely needs it. Prefer keeping the important state in the active conversation, checkpoint files, or targeted follow-up reads.
-- The harness now delays compaction until around 85% of the server context. With 256K context, that means compaction should not happen prematurely on normal hard tasks.
+- The harness now delays compaction until around 90% of the server context (fallback threshold 250k prompt tokens). With 256K context, this avoids premature compaction after the known ~235k-token large-file read case.
 - `read_file` can return up to 700k characters by default, but the model may still choose a smaller `max_chars` unless the task explicitly asks for the full file or a large value.
 - If the model struggles on a large task, first check whether it actually received the required context, whether it asked for a truncated tool result, and whether compaction happened.
 
@@ -43,6 +43,23 @@ Validation run:
 - Qwen correctly recovered the beginning, middle, and end sentinels.
 
 Conclusion: 256K context works on this hardware. The main remaining challenge is loop design: avoid unnecessary repeated huge prompt ingestion, preserve task state explicitly, and make large reads intentional.
+
+## Boot/service behavior
+
+The preferred runtime is also installed as a user systemd service on this machine:
+
+```bash
+systemctl --user status local-agent-qwen.service
+systemctl --user restart local-agent-qwen.service
+```
+
+The service starts the same 256K dual-GPU Qwen server on `127.0.0.1:19434` and is enabled for boot/login via user linger. `./start-servers.sh` remains the repo-local manual restart script and should match the service configuration.
+
+## Hard-task behavior
+
+The hard-task decomposition protocol is now part of the default system prompt. The model is instructed to plan multi-step work, checkpoint after roughly ten tool calls, create/update requested artifacts before doing another broad inspection pass, synthesize when approaching turn budget, and prefer relative write paths under the working directory.
+
+Empty-response recovery now retries up to four times; the final retry re-enables thinking at low sampling as a panic recovery attempt.
 
 ## Start the REPL
 
